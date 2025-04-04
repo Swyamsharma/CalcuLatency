@@ -150,25 +150,25 @@ async def handle_connection(websocket, path):
             # Compare WebSocket RTT with the refined 0trace RTT
             # Calculate difference as WS - 0trace (positive value suggests proxy)
             rtt_difference = min_ws_rtt - trace_rtt_ms
-        logging.info(f"{client_log_prefix} RTT Difference (WS Min - 0trace Min): {rtt_difference:.2f}ms")
+            logging.info(f"{client_log_prefix} RTT Difference (WS Min - 0trace Min): {rtt_difference:.2f}ms")
 
-        # Determine proxy status based on the difference and threshold
-        # A significantly positive difference (WS RTT >> 0trace RTT) indicates a proxy.
-        if rtt_difference > config.RTT_THRESHOLD_MS:
-            conclusion = "Proxy DETECTED"
-            result_data["proxy_detected"] = True
-            result_data["message"] = (
-                f"Result: {conclusion}. RTT Difference ({rtt_difference:.2f}ms) > Threshold ({config.RTT_THRESHOLD_MS:.1f}ms). "
-                f"WS Min RTT: {min_ws_rtt:.2f}ms ({len(ws_rtts_ms)} samples), 0trace Min RTT: {trace_rtt_ms:.2f}ms (Hop: {trace_hop_ip})"
-            )
-        else:
-            # Includes cases where difference is small positive, zero, or negative (0trace slightly higher but within tolerance)
-            conclusion = "Proxy NOT detected"
-            result_data["proxy_detected"] = False
-            result_data["message"] = (
-                f"Result: {conclusion}. RTT Difference ({rtt_difference:.2f}ms) <= Threshold ({config.RTT_THRESHOLD_MS:.1f}ms). "
-                f"WS Min RTT: {min_ws_rtt:.2f}ms ({len(ws_rtts_ms)} samples), 0trace Min RTT: {trace_rtt_ms:.2f}ms (Hop: {trace_hop_ip})"
-            )
+            # Determine proxy status based on the difference and threshold
+            # A significantly positive difference (WS RTT >> 0trace RTT) indicates a proxy.
+            if rtt_difference > config.RTT_THRESHOLD_MS:
+                conclusion = "Proxy DETECTED"
+                result_data["proxy_detected"] = True
+                result_data["message"] = (
+                    f"Result: {conclusion}. RTT Difference ({rtt_difference:.2f}ms) > Threshold ({config.RTT_THRESHOLD_MS:.1f}ms). "
+                    f"WS Min RTT: {min_ws_rtt:.2f}ms ({len(ws_rtts_ms)} samples), 0trace Min RTT: {trace_rtt_ms:.2f}ms (Hop: {trace_hop_ip})"
+                )
+            else:
+                # Includes cases where difference is small positive, zero, or negative (0trace slightly higher but within tolerance)
+                conclusion = "Proxy NOT detected"
+                result_data["proxy_detected"] = False
+                result_data["message"] = (
+                    f"Result: {conclusion}. RTT Difference ({rtt_difference:.2f}ms) <= Threshold ({config.RTT_THRESHOLD_MS:.1f}ms). "
+                    f"WS Min RTT: {min_ws_rtt:.2f}ms ({len(ws_rtts_ms)} samples), 0trace Min RTT: {trace_rtt_ms:.2f}ms (Hop: {trace_hop_ip})"
+                )
             logging.info(f"{client_log_prefix} Conclusion: {conclusion}.")
 
         # --- Send Result to Client (inside the main try block) ---
