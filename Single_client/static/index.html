@@ -1,0 +1,25 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>CalcuLatency Client</title>
+    <style>
+        body { font-family: sans-serif; padding: 20px; }
+        #status { margin-bottom: 15px; font-weight: bold; }
+        #result { margin-top: 15px; padding: 10px; border: 1px solid #ccc; background-color: #f9f9f9; white-space: pre-wrap; }
+        .connecting { color: orange; }
+        .connected { color: green; }
+        .error { color: red; }
+        .measuring { color: blue; }
+        .complete { color: black; }
+    </style>
+</head>
+<body>
+    <h1>CalcuLatency Client</h1>
+    <div id="status" class="connecting">Connecting to server...</div>
+    <div id="result">Waiting for results...</div>
+
+    <script src="script.js"></script>
+</body>
+</html>

@@ -13,10 +13,10 @@ from concurrent.futures import ThreadPoolExecutor
 # import http.server
 # import socketserver
 import os
-import functools
 import json
 import config # Import the configuration module
-from tracer import Tracer, run_sniffer as run_tracer_sniffer # Import Tracer class and sniffer runner
+# Import Tracer class for local instantiation, module callback, and sniffer runner
+from tracer import Tracer, icmp_packet_callback as tracer_callback, run_sniffer as run_tracer_sniffer
 from websocket_ping import measure_websocket_rtt # Import WebSocket ping function
 from static_server import start_static_server_thread # Import static server starter
 
@@ -45,7 +45,7 @@ else:
 sniffer_stop_event = threading.Event() # Used to signal sniffer thread termination
 sniffer_thread = None # Holds the sniffer thread object
 server_ip = None      # Holds the determined server IP
-tracer_instance = None # Holds the Tracer class instance
+# tracer_instance = None # No longer needed globally
 
 # --- Helper Functions ---
 # get_local_ip remains the same
@@ -69,11 +69,9 @@ def get_local_ip():
     return "0.0.0.0"
 
 # --- WebSocket Handler ---
-# Pass the global tracer instance to the handler
-async def handle_connection(websocket, path, tracer):
+# No longer needs tracer passed in
+async def handle_connection(websocket, path):
     """Handles WebSocket connections and runs measurements."""
-    # Add logging to check the received tracer instance
-    logging.info(f"handle_connection invoked. Received tracer type: {type(tracer)}, is None: {tracer is None}")
     client_addr = websocket.remote_address
     client_ip, client_port_str = client_addr
     client_port = int(client_port_str)
@@ -87,23 +85,16 @@ async def handle_connection(websocket, path, tracer):
         server_port_local = int(server_port_str)
 
         # --- Run 0trace ---
-        # Ensure the tracer instance is available
-        if tracer is None:
-            logging.error(f"{client_log_prefix} Tracer instance not available. Cannot perform 0trace.")
-            # Optionally send an error message to the client
-            try:
-                await websocket.send(json.dumps({"type": "error", "message": "Server tracer not initialized."}))
-            except websockets.exceptions.ConnectionClosed:
-                 pass # Ignore if connection is closed when trying to send error
-            return # Exit handler as we cannot proceed without the tracer
+        # Create a local Tracer instance for this connection's measurement logic
+        local_tracer = Tracer()
 
-        # Run the blocking Scapy code in a separate thread using the tracer instance's method
+        # Run the blocking Scapy code in a separate thread using the local tracer instance's method
         loop = asyncio.get_running_loop()
         with ThreadPoolExecutor() as pool:
-             # Pass the current sniffer thread (global) to the tracer's method
+             # Pass the global sniffer thread to the local tracer's method
              trace_rtt_ms, trace_hop_ip, trace_success = await loop.run_in_executor(
                  pool,
-                 tracer.measure_0trace_rtt, # Call the method on the instance
+                 local_tracer.measure_0trace_rtt, # Call the method on the local instance
                  server_ip_local,
                  server_port_local,
                  client_ip,
@@ -155,28 +146,32 @@ async def handle_connection(websocket, path, tracer):
             result_data["message"] = (f"WebSocket Min RTT: {min_ws_rtt:.2f}ms ({len(ws_rtts_ms)} samples). "
                                       f"0trace measurement did not succeed.")
         else:
-            # Compare WebSocket RTT with 0trace RTT
-            rtt_difference = abs(min_ws_rtt - trace_rtt_ms)
-            logging.info(f"{client_log_prefix} RTT Difference (WebSocket Min vs 0trace): {rtt_difference:.2f}ms")
+            # This block executes if trace_success is True
+            # Compare WebSocket RTT with the refined 0trace RTT
+            # Calculate difference as WS - 0trace (positive value suggests proxy)
+            rtt_difference = min_ws_rtt - trace_rtt_ms
+        logging.info(f"{client_log_prefix} RTT Difference (WS Min - 0trace Min): {rtt_difference:.2f}ms")
 
-            # Determine proxy status based on threshold
-            if rtt_difference > config.RTT_THRESHOLD_MS:
-                conclusion = "Proxy DETECTED"
-                result_data["proxy_detected"] = True
-                result_data["message"] = (
-                    f"{conclusion}. RTT Difference ({rtt_difference:.2f}ms) > Threshold ({config.RTT_THRESHOLD_MS:.1f}ms). "
-                    f"WS Min RTT: {min_ws_rtt:.2f}ms ({len(ws_rtts_ms)} samples), 0trace RTT: {trace_rtt_ms:.2f}ms (Hop: {trace_hop_ip})"
-                )
-            else:
-                conclusion = "Proxy NOT detected"
-                result_data["proxy_detected"] = False
-                result_data["message"] = (
-                    f"{conclusion}. RTT Difference ({rtt_difference:.2f}ms) <= Threshold ({config.RTT_THRESHOLD_MS:.1f}ms). "
-                    f"WS Min RTT: {min_ws_rtt:.2f}ms ({len(ws_rtts_ms)} samples), 0trace RTT: {trace_rtt_ms:.2f}ms (Hop: {trace_hop_ip})"
-                )
+        # Determine proxy status based on the difference and threshold
+        # A significantly positive difference (WS RTT >> 0trace RTT) indicates a proxy.
+        if rtt_difference > config.RTT_THRESHOLD_MS:
+            conclusion = "Proxy DETECTED"
+            result_data["proxy_detected"] = True
+            result_data["message"] = (
+                f"Result: {conclusion}. RTT Difference ({rtt_difference:.2f}ms) > Threshold ({config.RTT_THRESHOLD_MS:.1f}ms). "
+                f"WS Min RTT: {min_ws_rtt:.2f}ms ({len(ws_rtts_ms)} samples), 0trace Min RTT: {trace_rtt_ms:.2f}ms (Hop: {trace_hop_ip})"
+            )
+        else:
+            # Includes cases where difference is small positive, zero, or negative (0trace slightly higher but within tolerance)
+            conclusion = "Proxy NOT detected"
+            result_data["proxy_detected"] = False
+            result_data["message"] = (
+                f"Result: {conclusion}. RTT Difference ({rtt_difference:.2f}ms) <= Threshold ({config.RTT_THRESHOLD_MS:.1f}ms). "
+                f"WS Min RTT: {min_ws_rtt:.2f}ms ({len(ws_rtts_ms)} samples), 0trace Min RTT: {trace_rtt_ms:.2f}ms (Hop: {trace_hop_ip})"
+            )
             logging.info(f"{client_log_prefix} Conclusion: {conclusion}.")
 
-        # --- Send Result to Client ---
+        # --- Send Result to Client (inside the main try block) ---
         # Check connection one last time before sending
         if websocket.closed:
              logging.info(f"{client_log_prefix} Connection closed before sending final result.")
@@ -216,10 +211,10 @@ async def handle_connection(websocket, path, tracer):
 # --- Main Server Logic ---
 async def main():
     # Declare globals that will be assigned in this function
-    global server_ip, sniffer_thread, sniffer_stop_event, tracer_instance
+    # No longer need tracer_instance here
+    global server_ip, sniffer_thread, sniffer_stop_event
 
-    # Initialize the Tracer instance
-    tracer_instance = Tracer()
+    # tracer_instance = Tracer() # No longer needed globally
 
     server_ip = get_local_ip()
     if server_ip == "0.0.0.0":
@@ -246,7 +241,7 @@ async def main():
         args=(
             iface,
             server_ip,
-            tracer_instance.icmp_packet_callback, # Pass the tracer's callback method
+            tracer_callback, # Pass the module-level callback function
             sniffer_stop_event # Pass the stop event
         ),
         daemon=True # Allows main program to exit even if thread is running
@@ -279,16 +274,15 @@ async def main():
     # Start the WebSocket server
     stop_signal = asyncio.Future() # Used to keep the server running
 
-    # --- Connection Handling with Tracer ---
-    # Add logging before creating the partial function
-    logging.info(f"Initializing connection handler. Global tracer_instance type: {type(tracer_instance)}, is None: {tracer_instance is None}")
-    # Use functools.partial to pass the tracer_instance to the connection handler
-    # This avoids needing tracer_instance as a global inside handle_connection
-    connection_handler_with_tracer = functools.partial(handle_connection, tracer=tracer_instance)
+    # --- Start WebSocket Server ---
+    # No need for functools.partial anymore, just pass the handle_connection function directly
+    # logging.info(f"Initializing connection handler. Global tracer_instance type: {type(tracer_instance)}, is None: {tracer_instance is None}")
+    # connection_handler_with_tracer = functools.partial(handle_connection, tracer=tracer_instance)
 
     try:
         # The `serve` context manager handles server startup and shutdown
-        async with websockets.serve(connection_handler_with_tracer, "0.0.0.0", config.SERVER_PORT):
+        # Pass the handle_connection function directly
+        async with websockets.serve(handle_connection, "0.0.0.0", config.SERVER_PORT):
             logging.info("WebSocket server started successfully.")
             await stop_signal # Keep the server running until stop_signal is set or an error occurs
     except OSError as e:

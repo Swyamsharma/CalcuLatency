@@ -14,9 +14,11 @@ WEBSOCKET_PING_INTERVAL_S = 0.1
 
 # --- 0trace Configuration ---
 MAX_TTL = 32
-TRACE_TIMEOUT_S = 1.0 # Timeout for waiting for ICMP responses for a given TTL
-PROBES_PER_TTL = 3 # Number of probe packets to send for each TTL
-EARLY_EXIT_TIMEOUT_COUNT = 5 # Stop trace if this many consecutive TTLs timeout
+TRACE_TIMEOUT_S = 1.0 # Timeout for waiting for ICMP responses for a given TTL in initial scan
+PROBES_PER_TTL = 3 # Number of probe packets to send for each TTL in initial scan
+EARLY_EXIT_TIMEOUT_COUNT = 5 # Stop initial scan if this many consecutive TTLs timeout
+FINAL_RTT_PROBE_COUNT = 10 # Number of probes to send to find the minimum RTT to the final hop
+FINAL_RTT_PROBE_TIMEOUT_S = 0.75 # Timeout for waiting for responses during final RTT probing (can be shorter)
 
 # --- Analysis Configuration ---
 RTT_THRESHOLD_MS = 50.0 # Threshold for detecting proxy based on RTT difference
