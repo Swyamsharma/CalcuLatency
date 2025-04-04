@@ -42,28 +42,39 @@ function connectWebSocket() {
                 } else {
                     console.warn('WebSocket not open, cannot send pong.');
                 }
-            } else {
-                console.warn('Received unexpected JSON message format:', message);
-                 // Display other JSON messages as text for debugging
-                resultDiv.textContent = `Received unexpected JSON: ${event.data}`;
-                statusDiv.textContent = 'Received unexpected data.';
-                statusDiv.className = 'error';
             }
+            // --- Check for Result Type ---
+            else if (message.type === 'result' && message.data) {
+                // Handle the structured result message from the server
+                console.log('Received result data:', message.data);
+                // Display the pre-formatted message string from the server's result_data
+                    resultDiv.textContent = message.data.message || 'Result received but message field missing.';
+                statusDiv.textContent = 'Measurement Complete.';
+                statusDiv.className = 'complete';
+                // Optionally display more details if needed:
+                // resultDiv.innerHTML += `<br><small>WS RTT: ${message.data.ws_min_rtt_ms?.toFixed(2)} ms (${message.data.ws_rtt_samples} samples)</small>`;
+                // resultDiv.innerHTML += `<br><small>0trace RTT: ${message.data.trace_rtt_ms?.toFixed(2)} ms (Hop: ${message.data.trace_hop_ip || 'N/A'})</small>`;
+            }
+            // --- Check for Error Type ---
+            else if (message.type === 'error' && message.message) {
+                 // Handle specific error messages sent by the server
+                 console.error('Received error message from server:', message.message);
+                 resultDiv.textContent = `Server Error: ${message.message}`;
+                     statusDiv.textContent = 'Measurement Error.';
+                     statusDiv.className = 'error';
+                } else {
+                    // Handle other valid JSON messages if necessary
+                    console.warn('Received unexpected JSON message format:', message);
+                    resultDiv.textContent = `Received unexpected JSON data: ${event.data}`;
+                    statusDiv.textContent = 'Received unexpected data.';
+                    statusDiv.className = 'error';
+                }
         } catch (e) {
-            // Handle non-JSON messages (likely the final result or an error string from Python server)
-            console.log('Received non-JSON message (likely result or error):', event.data);
-            resultDiv.textContent = event.data; // Display the raw string message
-            if (event.data.toLowerCase().includes('error')) {
-                 statusDiv.textContent = 'Measurement Error.';
-                 statusDiv.className = 'error';
-            } else if (event.data.toLowerCase().includes('result:')) {
-                 statusDiv.textContent = 'Measurement Complete.';
-                 statusDiv.className = 'complete';
-            } else {
-                 // Handle other potential status messages if needed
-                 statusDiv.textContent = 'Received status update.';
-                 statusDiv.className = 'measuring';
-            }
+            // This block now likely indicates a non-JSON message or a parsing error
+            console.error('Failed to parse message or received non-JSON data:', event.data, e);
+            resultDiv.textContent = `Error processing server message: ${event.data}`;
+            statusDiv.textContent = 'Communication Error.';
+            statusDiv.className = 'error';
         }
     };
 

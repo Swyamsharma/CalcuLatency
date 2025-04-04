@@ -9,18 +9,23 @@ import socket
 import threading
 import random
 from concurrent.futures import ThreadPoolExecutor
-import http.server
-import socketserver
+# Remove http.server and socketserver imports as they are now in static_server.py
+# import http.server
+# import socketserver
 import os
 import functools
 import json
+import config # Import the configuration module
+from tracer import Tracer, run_sniffer as run_tracer_sniffer # Import Tracer class and sniffer runner
+from websocket_ping import measure_websocket_rtt # Import WebSocket ping function
+from static_server import start_static_server_thread # Import static server starter
 
 try:
-    from scapy.all import IP, TCP, ICMP, sr1, send, sniff, conf
-    from scapy.layers.inet import IPerror, TCPerror
-    conf.verb = 0 # Make Scapy less verbose
+    # Scapy import needed for conf object access, even if logic moved
+    from scapy.all import conf
+    # No longer need direct IP, TCP, ICMP etc. imports here
 except ImportError:
-    logging.error("Scapy is not installed or import failed. Please run: pip install scapy")
+    logging.error("Scapy base import failed in server.py. Is it installed?")
     exit(1)
 except OSError as e:
     logging.error(f"Error initializing Scapy (maybe npcap/libpcap issue?): {e}")
@@ -28,26 +33,22 @@ except OSError as e:
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s: %(message)s')
 
-# --- Configuration ---
-SERVER_PORT = 8080
-WEBSOCKET_PING_COUNT = 10
-RTT_THRESHOLD_MS = 50.0
-MAX_TTL = 32
-TRACE_TIMEOUT_S = 1.0
-PROBES_PER_TTL = 3
-EARLY_EXIT_TIMEOUT_COUNT = 5
-STATIC_DIR = "static"
+# Set Scapy verbosity from config
+# Ensure conf was imported successfully before accessing
+if 'conf' in locals() or 'conf' in globals():
+    conf.verb = config.SCAPY_VERBOSITY
+else:
+    logging.warning("Scapy 'conf' object not available, cannot set verbosity.")
 
-# --- 0trace Globals / Shared State ---
-icmp_responses = {}
-icmp_responses_lock = threading.Lock()
-probes_sent = {}
-probes_sent_lock = threading.Lock()
-sniffer_stop_event = threading.Event()
-sniffer_thread = None
-server_ip = None
+
+# --- Global State (Reduced) ---
+sniffer_stop_event = threading.Event() # Used to signal sniffer thread termination
+sniffer_thread = None # Holds the sniffer thread object
+server_ip = None      # Holds the determined server IP
+tracer_instance = None # Holds the Tracer class instance
 
 # --- Helper Functions ---
+# get_local_ip remains the same
 def get_local_ip():
     """Finds a suitable non-loopback IPv4 address for the server."""
     try:
@@ -58,7 +59,8 @@ def get_local_ip():
             if netifaces.AF_INET in ifaddresses:
                 for link in ifaddresses[netifaces.AF_INET]:
                     ip = link.get('addr')
-                    if ip and not ip.startswith('127.'):
+                    # Basic check to prefer non-link-local, non-loopback
+                    if ip and not ip.startswith('127.') and not ip.startswith('169.254.'):
                         logging.info(f"Using local IP {ip} from interface {iface_name}")
                         return ip
     except Exception as e:
@@ -66,260 +68,163 @@ def get_local_ip():
     logging.warning("Could not automatically determine local IP. Using 0.0.0.0")
     return "0.0.0.0"
 
-# --- 0trace Implementation ---
-
-def icmp_packet_callback(packet):
-    """Callback function for the Scapy sniffer."""
-    global icmp_responses, icmp_responses_lock
-    try:
-        if packet.haslayer(ICMP) and packet.haslayer(IP):
-            icmp_layer = packet.getlayer(ICMP)
-            outer_ip = packet.getlayer(IP)
-            if icmp_layer.type == 11 or icmp_layer.type == 3: # Time Exceeded or Dest Unreachable
-                if packet.haslayer(IPerror) and packet.haslayer(TCPerror):
-                    inner_tcp = packet.getlayer(TCPerror)
-                    original_seq = inner_tcp.seq
-                    response_info = (time.time(), outer_ip.src)
-                    with icmp_responses_lock:
-                        icmp_responses[original_seq] = response_info
-    except Exception as e:
-        logging.error(f"Error in ICMP callback: {e}")
-
-def stop_sniffer_filter(packet):
-    """Used by Scapy's sniff function to know when to stop."""
-    return sniffer_stop_event.is_set()
-
-def run_sniffer(interface, server_ip_filter):
-    """Runs the Scapy sniffer in a separate thread."""
-    global sniffer_stop_event
-    logging.info(f"Starting ICMP sniffer on interface {interface}...")
-    bpf_filter = f"icmp and dst host {server_ip_filter}"
-    try:
-        sniff(iface=interface, filter=bpf_filter, prn=icmp_packet_callback, stop_filter=stop_sniffer_filter, store=0)
-    except OSError as e:
-         logging.error(f"Sniffer failed to start on {interface}. Error: {e}. Check permissions/interface.")
-    except Exception as e:
-        logging.error(f"Sniffer encountered an error: {e}")
-    logging.info("ICMP sniffer stopped.")
-
-def measure_0trace_rtt(local_ip_str, local_port, remote_ip_str, remote_port):
-    """Performs the 0trace measurement using Scapy."""
-    global probes_sent, probes_sent_lock, icmp_responses, icmp_responses_lock, sniffer_thread
-    logging.info(f"[{remote_ip_str}:{remote_port}] Starting 0trace measurement...")
-
-    if sniffer_thread is None or not sniffer_thread.is_alive():
-         logging.error("Sniffer thread not running. Cannot perform 0trace.")
-         return 0, None, False
-
-    results = {}
-    max_responded_ttl = 0
-    final_rtt = 0
-    final_hop_ip = None
-    trace_success = False
-    destination_reached_flag = False
-    consecutive_timeouts = 0
-
-    logging.info(f"[{remote_ip_str}:{remote_port}] 0trace: Starting TTL loop...")
-    for ttl in range(1, MAX_TTL + 1):
-        received_in_ttl = False
-        sent_seqs_this_ttl = []
-
-        for i in range(PROBES_PER_TTL):
-            tcp_seq = random.randint(1, 2**32 - 1)
-            ip_layer = IP(dst=remote_ip_str, ttl=ttl)
-            tcp_layer = TCP(dport=remote_port, sport=local_port, flags='A', seq=tcp_seq, ack=random.randint(1, 2**32 - 1))
-            packet = ip_layer / tcp_layer
-
-            send_time = time.time()
-            try:
-                send(packet, verbose=0)
-                with probes_sent_lock:
-                    probes_sent[tcp_seq] = (send_time, ttl)
-                sent_seqs_this_ttl.append(tcp_seq)
-            except OSError as e:
-                 logging.error(f"[{remote_ip_str}:{remote_port}] 0trace Error sending packet (TTL {ttl}, Probe {i}, Seq {tcp_seq}): {e}. Check permissions.")
-                 if i == PROBES_PER_TTL - 1 and not sent_seqs_this_ttl: return 0, None, False
-                 continue
-            except Exception as e:
-                logging.error(f"[{remote_ip_str}:{remote_port}] 0trace Error sending packet (TTL {ttl}, Probe {i}, Seq {tcp_seq}): {e}")
-                continue
-
-        wait_deadline = time.time() + TRACE_TIMEOUT_S
-        processed_seqs_in_wait = set()
-
-        while time.time() < wait_deadline and not received_in_ttl:
-            time.sleep(0.05)
-            found_response_this_poll = False
-            with icmp_responses_lock:
-                keys_to_check = list(icmp_responses.keys())
-                for seq in keys_to_check:
-                    if seq in processed_seqs_in_wait or seq not in sent_seqs_this_ttl: continue
-                    resp_time, hop_ip_str = icmp_responses[seq]
-                    with probes_sent_lock:
-                        if seq in probes_sent:
-                            send_time, probe_ttl = probes_sent[seq]
-                            if probe_ttl == ttl:
-                                rtt_s = resp_time - send_time
-                                rtt_ms = rtt_s * 1000.0
-                                logging.info(f"[{remote_ip_str}:{remote_port}] 0trace Received ICMP: TTL={ttl}, Hop={hop_ip_str}, RTT={rtt_ms:.2f}ms (Orig Seq: {seq})")
-                                if ttl not in results or rtt_s < results[ttl][1]:
-                                    results[ttl] = (hop_ip_str, rtt_s)
-                                max_responded_ttl = ttl
-                                received_in_ttl = True
-                                found_response_this_poll = True
-                                processed_seqs_in_wait.add(seq)
-                                del icmp_responses[seq]
-                                if hop_ip_str == remote_ip_str:
-                                    logging.info(f"[{remote_ip_str}:{remote_port}] 0trace: Destination reached at TTL {ttl}")
-                                    trace_success = True
-                                    destination_reached_flag = True
-                                    break
-            if destination_reached_flag: break
-
-        if destination_reached_flag: break
-
-        if not received_in_ttl:
-            logging.info(f"[{remote_ip_str}:{remote_port}] 0trace Timeout: No response for TTL {ttl}")
-            consecutive_timeouts += 1
-            if consecutive_timeouts >= EARLY_EXIT_TIMEOUT_COUNT:
-                logging.warning(f"[{remote_ip_str}:{remote_port}] 0trace: Exiting early after {EARLY_EXIT_TIMEOUT_COUNT} consecutive timeouts.")
-                break
-        else:
-            consecutive_timeouts = 0
-
-    if max_responded_ttl > 0 and max_responded_ttl in results:
-        final_hop_ip_str, final_rtt_s = results[max_responded_ttl]
-        final_rtt = final_rtt_s * 1000.0
-        final_hop_ip = final_hop_ip_str
-        if not trace_success: trace_success = True
-        logging.info(f"[{remote_ip_str}:{remote_port}] 0trace Final Result: MaxTTL={max_responded_ttl}, Hop={final_hop_ip}, RTT={final_rtt:.2f}ms")
-    else:
-        logging.info(f"[{remote_ip_str}:{remote_port}] 0trace Final Result: No responsive hops found.")
-        trace_success = False
-
-    with probes_sent_lock:
-        keys_to_delete = list(probes_sent.keys())
-        for seq in keys_to_delete:
-            del probes_sent[seq]
-            with icmp_responses_lock:
-                 icmp_responses.pop(seq, None)
-
-    logging.info(f"[{remote_ip_str}:{remote_port}] 0trace measurement finished. Success: {trace_success}")
-    return final_rtt, final_hop_ip, trace_success
-
 # --- WebSocket Handler ---
-async def handle_connection(websocket, path):
+# Pass the global tracer instance to the handler
+async def handle_connection(websocket, path, tracer):
     """Handles WebSocket connections and runs measurements."""
+    # Add logging to check the received tracer instance
+    logging.info(f"handle_connection invoked. Received tracer type: {type(tracer)}, is None: {tracer is None}")
     client_addr = websocket.remote_address
     client_ip, client_port_str = client_addr
     client_port = int(client_port_str)
     logging.info(f"WebSocket connection established from: {client_ip}:{client_port}")
 
-    server_addr = websocket.local_address
-    server_ip_local, server_port_str = server_addr
-    server_port_local = int(server_port_str)
+    client_log_prefix = f"[{client_ip}:{client_port}]" # For consistent logging
 
-    loop = asyncio.get_running_loop()
-    with ThreadPoolExecutor() as pool:
-         trace_rtt_ms, trace_hop_ip, trace_success = await loop.run_in_executor(
-             pool, measure_0trace_rtt, server_ip_local, server_port_local, client_ip, client_port
-         )
-
-    if not trace_success:
-        logging.info(f"[{client_ip}:{client_port}] 0trace measurement failed or did not reach destination.")
-    else:
-        logging.info(f"[{client_ip}:{client_port}] 0trace Results: Furthest Hop = {trace_hop_ip}, RTT = {trace_rtt_ms:.2f}ms")
-
-    logging.info(f"[{client_ip}:{client_port}] Starting WebSocket ping...")
-    ws_rtts_ms = []
     try:
-        for i in range(WEBSOCKET_PING_COUNT):
-            start_time = time.time()
-            ping_payload = {"type": "ping", "timestamp": int(start_time * 1000)}
-            await websocket.send(json.dumps(ping_payload))
+        server_addr = websocket.local_address
+        server_ip_local, server_port_str = server_addr
+        server_port_local = int(server_port_str)
+
+        # --- Run 0trace ---
+        # Ensure the tracer instance is available
+        if tracer is None:
+            logging.error(f"{client_log_prefix} Tracer instance not available. Cannot perform 0trace.")
+            # Optionally send an error message to the client
             try:
-                pong_data = await asyncio.wait_for(websocket.recv(), timeout=5.0)
-                end_time = time.time()
-                try:
-                    pong_payload = json.loads(pong_data)
-                    if pong_payload.get("type") == "pong" and pong_payload.get("timestamp") == ping_payload["timestamp"]:
-                        rtt_s = end_time - start_time
-                        ws_rtts_ms.append(rtt_s * 1000.0)
-                    else:
-                        logging.warning(f"[{client_ip}:{client_port}] Pong mismatch or wrong type: {pong_payload}")
-                except json.JSONDecodeError:
-                     logging.warning(f"[{client_ip}:{client_port}] Could not parse pong JSON: {pong_data}")
-                except Exception as parse_err:
-                    logging.warning(f"[{client_ip}:{client_port}] Error processing pong: {parse_err}")
-            except asyncio.TimeoutError:
-                logging.warning(f"[{client_ip}:{client_port}] WebSocket pong timeout.")
-                continue
-            except Exception as e:
-                 logging.error(f"[{client_ip}:{client_port}] Error receiving WebSocket pong: {e}")
-                 break
-            await asyncio.sleep(0.1)
-    except websockets.exceptions.ConnectionClosedOK:
-        logging.info(f"Connection closed normally by {client_ip}:{client_port}")
-        return
-    except Exception as e:
-        logging.error(f"WebSocket error with {client_ip}:{client_port}: {e}")
-        return
+                await websocket.send(json.dumps({"type": "error", "message": "Server tracer not initialized."}))
+            except websockets.exceptions.ConnectionClosed:
+                 pass # Ignore if connection is closed when trying to send error
+            return # Exit handler as we cannot proceed without the tracer
 
-    if not ws_rtts_ms:
-        logging.error(f"[{client_ip}:{client_port}] No successful WebSocket pings.")
-        try: await websocket.send("Error: Failed to get WebSocket RTT.")
-        except: pass
-        return
+        # Run the blocking Scapy code in a separate thread using the tracer instance's method
+        loop = asyncio.get_running_loop()
+        with ThreadPoolExecutor() as pool:
+             # Pass the current sniffer thread (global) to the tracer's method
+             trace_rtt_ms, trace_hop_ip, trace_success = await loop.run_in_executor(
+                 pool,
+                 tracer.measure_0trace_rtt, # Call the method on the instance
+                 server_ip_local,
+                 server_port_local,
+                 client_ip,
+                 client_port,
+                 sniffer_thread # Pass the global sniffer thread object
+             )
 
-    min_ws_rtt = min(ws_rtts_ms) if ws_rtts_ms else 0
-    logging.info(f"[{client_ip}:{client_port}] WebSocket Results: Min RTT = {min_ws_rtt:.2f}ms ({len(ws_rtts_ms)} successful pings)")
-
-    result_message = ""
-    if not trace_success:
-        logging.info(f"[{client_ip}:{client_port}] Conclusion: Cannot determine proxy status reliably without successful 0trace RTT.")
-        result_message = f"Result: WebSocket Min RTT = {min_ws_rtt:.2f}ms. 0trace measurement failed, cannot reliably detect proxy."
-    else:
-        rtt_difference = abs(min_ws_rtt - trace_rtt_ms)
-        logging.info(f"[{client_ip}:{client_port}] RTT Difference (WebSocket Min vs 0trace): {rtt_difference:.2f}ms")
-        if rtt_difference > RTT_THRESHOLD_MS:
-            conclusion = "Proxy DETECTED"
-            result_message = (f"Result: {conclusion}. RTT Difference ({rtt_difference:.2f}ms) > Threshold ({RTT_THRESHOLD_MS:.1f}ms). "
-                              f"WS Min RTT: {min_ws_rtt:.2f}ms, 0trace RTT: {trace_rtt_ms:.2f}ms (Hop: {trace_hop_ip})")
+        # --- Process 0trace Results ---
+        if not trace_success:
+            logging.info(f"{client_log_prefix} 0trace measurement failed or did not reach destination.")
         else:
-            conclusion = "Proxy NOT detected"
-            result_message = (f"Result: {conclusion}. RTT Difference ({rtt_difference:.2f}ms) <= Threshold ({RTT_THRESHOLD_MS:.1f}ms). "
-                              f"WS Min RTT: {min_ws_rtt:.2f}ms, 0trace RTT: {trace_rtt_ms:.2f}ms (Hop: {trace_hop_ip})")
-        logging.info(f"[{client_ip}:{client_port}] Conclusion: {conclusion}.")
+            logging.info(f"{client_log_prefix} 0trace Results: Furthest Hop = {trace_hop_ip}, RTT = {trace_rtt_ms:.2f}ms")
 
-    try:
-        await websocket.send(result_message)
-    except websockets.exceptions.ConnectionClosedOK: pass
-    except Exception as e: logging.error(f"Error sending final result to {client_ip}:{client_port}: {e}")
-
-    logging.info(f"[{client_ip}:{client_port}] Measurement complete.")
-
-# --- Static File Server ---
-def run_static_server(port, directory):
-    """Runs a simple HTTP server for static files."""
-    handler = functools.partial(http.server.SimpleHTTPRequestHandler, directory=directory)
-    socketserver.TCPServer.allow_reuse_address = True
-    try:
-        if not os.path.isdir(directory):
-             logging.error(f"Static directory '{directory}' not found. Cannot start static server.")
+        # --- WebSocket Ping Measurement ---
+        # Check connection before starting ping
+        if websocket.closed:
+             logging.info(f"{client_log_prefix} Connection closed before WebSocket ping sequence.")
              return
-        with socketserver.TCPServer(("", port), handler) as httpd:
-            logging.info(f"Static file server thread started on port {port}, serving '{directory}'")
-            httpd.serve_forever()
-    except OSError as e: logging.error(f"Static file server failed to start on port {port}: {e}")
-    except Exception as e: logging.error(f"Static file server encountered an error: {e}")
-    logging.info("Static file server thread stopped.")
+        ws_rtts_ms = await measure_websocket_rtt(websocket, client_log_prefix)
+
+        # --- Analyze Results ---
+        # Check connection again before analysis
+        if websocket.closed:
+            logging.info(f"{client_log_prefix} Connection closed after WebSocket ping sequence. Skipping analysis.")
+            return
+
+        if not ws_rtts_ms:
+            logging.error(f"{client_log_prefix} No successful WebSocket pings.")
+            # Try sending error to client
+            await websocket.send(json.dumps({"type": "error", "message": "Failed to get WebSocket RTT."}))
+            return
+
+        min_ws_rtt = min(ws_rtts_ms) if ws_rtts_ms else 0
+        logging.info(f"{client_log_prefix} WebSocket Results: Min RTT = {min_ws_rtt:.2f}ms ({len(ws_rtts_ms)} successful pings)")
+
+        result_data = {
+            "ws_min_rtt_ms": min_ws_rtt,
+            "ws_rtt_samples": len(ws_rtts_ms),
+            "trace_rtt_ms": trace_rtt_ms if trace_success else None,
+            "trace_hop_ip": trace_hop_ip if trace_success else None,
+            "trace_success": trace_success,
+            "threshold_ms": config.RTT_THRESHOLD_MS,
+            "proxy_detected": None, # Default to unknown
+            "message": ""
+        }
+
+        if not trace_success:
+            logging.info(f"{client_log_prefix} Conclusion: Cannot determine proxy status reliably (0trace failed or incomplete).")
+            result_data["message"] = (f"WebSocket Min RTT: {min_ws_rtt:.2f}ms ({len(ws_rtts_ms)} samples). "
+                                      f"0trace measurement did not succeed.")
+        else:
+            # Compare WebSocket RTT with 0trace RTT
+            rtt_difference = abs(min_ws_rtt - trace_rtt_ms)
+            logging.info(f"{client_log_prefix} RTT Difference (WebSocket Min vs 0trace): {rtt_difference:.2f}ms")
+
+            # Determine proxy status based on threshold
+            if rtt_difference > config.RTT_THRESHOLD_MS:
+                conclusion = "Proxy DETECTED"
+                result_data["proxy_detected"] = True
+                result_data["message"] = (
+                    f"{conclusion}. RTT Difference ({rtt_difference:.2f}ms) > Threshold ({config.RTT_THRESHOLD_MS:.1f}ms). "
+                    f"WS Min RTT: {min_ws_rtt:.2f}ms ({len(ws_rtts_ms)} samples), 0trace RTT: {trace_rtt_ms:.2f}ms (Hop: {trace_hop_ip})"
+                )
+            else:
+                conclusion = "Proxy NOT detected"
+                result_data["proxy_detected"] = False
+                result_data["message"] = (
+                    f"{conclusion}. RTT Difference ({rtt_difference:.2f}ms) <= Threshold ({config.RTT_THRESHOLD_MS:.1f}ms). "
+                    f"WS Min RTT: {min_ws_rtt:.2f}ms ({len(ws_rtts_ms)} samples), 0trace RTT: {trace_rtt_ms:.2f}ms (Hop: {trace_hop_ip})"
+                )
+            logging.info(f"{client_log_prefix} Conclusion: {conclusion}.")
+
+        # --- Send Result to Client ---
+        # Check connection one last time before sending
+        if websocket.closed:
+             logging.info(f"{client_log_prefix} Connection closed before sending final result.")
+             return
+
+        await websocket.send(json.dumps({"type": "result", "data": result_data}))
+        logging.info(f"{client_log_prefix} Result sent successfully.")
+
+    except websockets.exceptions.ConnectionClosedOK:
+        logging.info(f"{client_log_prefix} Connection closed normally during handling.")
+    except websockets.exceptions.ConnectionClosedError as e:
+        logging.warning(f"{client_log_prefix} Connection closed abnormally during handling: {e}")
+    except Exception as e:
+        # Catch any other unexpected errors during the handler execution
+        logging.error(f"{client_log_prefix} Unexpected error in handle_connection: {e}", exc_info=True)
+        # Try to close the connection gracefully if it's still open
+        if not websocket.closed:
+            try:
+                await websocket.close(code=1011, reason="Internal server error")
+            except Exception as close_err:
+                logging.error(f"{client_log_prefix} Error closing websocket after exception: {close_err}")
+    finally:
+        # This block executes whether an exception occurred or not.
+        # Ensures we log completion or disconnection for every connection attempt.
+        if websocket.closed:
+             logging.info(f"{client_log_prefix} WebSocket connection already closed.")
+        else:
+             # If the handler finished normally and the socket isn't closed, close it now.
+             logging.info(f"{client_log_prefix} Handler finished, closing WebSocket.")
+             try:
+                 await websocket.close(code=1000, reason="Measurement complete") # Normal closure
+             except Exception as close_err:
+                 logging.error(f"{client_log_prefix} Error during explicit close: {close_err}")
+
+        logging.info(f"{client_log_prefix} Measurement handling complete.")
 
 # --- Main Server Logic ---
 async def main():
-    global server_ip, sniffer_thread, sniffer_stop_event
+    # Declare globals that will be assigned in this function
+    global server_ip, sniffer_thread, sniffer_stop_event, tracer_instance
+
+    # Initialize the Tracer instance
+    tracer_instance = Tracer()
+
     server_ip = get_local_ip()
     if server_ip == "0.0.0.0":
          logging.warning("Server IP detected as 0.0.0.0. ICMP filtering might not be precise.")
+         # Attempt fallback using hostname resolution
          try:
              hostname = socket.gethostname()
              ip_via_hostname = socket.gethostbyname(hostname)
@@ -328,41 +233,92 @@ async def main():
                   server_ip = ip_via_hostname
          except socket.gaierror: logging.error("Could not resolve hostname to IP either.")
 
-    iface = conf.iface
-    logging.info(f"Attempting to start sniffer on interface: {iface}")
-    sniffer_stop_event.clear()
-    sniffer_thread = threading.Thread(target=run_sniffer, args=(iface, server_ip), daemon=True)
+    # Determine the interface for Scapy sniffing
+    # Using conf.iface is usually the best default, but might need adjustment
+    # depending on the system or if multiple active interfaces exist.
+    iface = conf.iface # Use Scapy's default interface detection
+    logging.info(f"Attempting to start sniffer on default interface: {iface}")
+
+    # Start the ICMP sniffer thread using the function from tracer module
+    sniffer_stop_event.clear() # Ensure the stop event is not set initially
+    sniffer_thread = threading.Thread(
+        target=run_tracer_sniffer, # Use the imported sniffer function
+        args=(
+            iface,
+            server_ip,
+            tracer_instance.icmp_packet_callback, # Pass the tracer's callback method
+            sniffer_stop_event # Pass the stop event
+        ),
+        daemon=True # Allows main program to exit even if thread is running
+    )
     sniffer_thread.start()
-    await asyncio.sleep(1)
+    await asyncio.sleep(1) # Give sniffer time to initialize
 
     if not sniffer_thread.is_alive():
          logging.error("Sniffer thread failed to start. Exiting. Check permissions and interface name.")
+         # Exit if sniffer fails to start, as 0trace depends on it.
+         # Exit if sniffer fails to start, as 0trace depends on it.
          return
 
-    logging.info(f"Starting WebSocket server on {server_ip}:{SERVER_PORT}")
-    logging.info(f"Access the client HTML page at http://{server_ip}:8081")
-    logging.info(f"WebSocket connections should go to ws://{server_ip}:{SERVER_PORT}")
-    logging.info("NOTE: Server needs root privileges (sudo) for Scapy raw sockets and sniffing.")
+    # Start the static file server using the dedicated function
+    static_server_thread = start_static_server_thread(config.STATIC_SERVER_PORT, config.STATIC_DIR)
+    if not static_server_thread or not static_server_thread.is_alive():
+        logging.error("Static file server thread failed to start. Check logs.")
+        # Decide if you want to exit or continue without the static server
+        # return # Uncomment to exit if static server fails
 
-    static_file_port = 8081
-    static_server_thread = threading.Thread(target=run_static_server, args=(static_file_port, STATIC_DIR), daemon=True)
-    static_server_thread.start()
-    logging.info(f"Started static file server for '{STATIC_DIR}' on port {static_file_port}")
+    # Give the static server a moment to start up (optional, but can be helpful)
     await asyncio.sleep(0.5)
 
+    logging.info(f"Starting WebSocket server on ws://0.0.0.0:{config.SERVER_PORT}")
+    # Determine the accessible IP for the client page message
+    display_ip = server_ip if server_ip != "0.0.0.0" else "localhost"
+    logging.info(f"Access the client HTML page at http://{display_ip}:{config.STATIC_SERVER_PORT}")
+    logging.info("NOTE: Server likely needs root privileges (sudo) for Scapy raw sockets and sniffing.")
+
+    # Start the WebSocket server
+    stop_signal = asyncio.Future() # Used to keep the server running
+
+    # --- Connection Handling with Tracer ---
+    # Add logging before creating the partial function
+    logging.info(f"Initializing connection handler. Global tracer_instance type: {type(tracer_instance)}, is None: {tracer_instance is None}")
+    # Use functools.partial to pass the tracer_instance to the connection handler
+    # This avoids needing tracer_instance as a global inside handle_connection
+    connection_handler_with_tracer = functools.partial(handle_connection, tracer=tracer_instance)
+
     try:
-        async with websockets.serve(handle_connection, "0.0.0.0", SERVER_PORT):
-            await asyncio.Future()
+        # The `serve` context manager handles server startup and shutdown
+        async with websockets.serve(connection_handler_with_tracer, "0.0.0.0", config.SERVER_PORT):
+            logging.info("WebSocket server started successfully.")
+            await stop_signal # Keep the server running until stop_signal is set or an error occurs
     except OSError as e:
-         if "address already in use" in str(e).lower(): logging.error(f"Server failed to start: Port {SERVER_PORT} is already in use.")
-         else: logging.error(f"Server failed to start (WebSocket): {e}")
-    except Exception as e: logging.error(f"Server encountered an error: {e}")
+         # Handle common startup errors like port already in use
+         if "address already in use" in str(e).lower():
+             logging.error(f"WebSocket server failed to start: Port {config.SERVER_PORT} is already in use.")
+         else:
+             logging.error(f"WebSocket server failed to start due to OS error: {e}")
+    except Exception as e:
+        logging.error(f"WebSocket server encountered an unexpected error: {e}")
     finally:
+        # --- Cleanup ---
         logging.info("Server shutting down...")
+
+        # Signal the sniffer thread to stop
+        logging.debug("Setting sniffer stop event.")
         sniffer_stop_event.set()
+
+        # Wait for the sniffer thread to finish
         if sniffer_thread and sniffer_thread.is_alive():
-             sniffer_thread.join(timeout=2.0)
-             if sniffer_thread.is_alive(): logging.warning("Sniffer thread did not exit cleanly.")
+             logging.debug("Joining sniffer thread...")
+             sniffer_thread.join(timeout=2.0) # Wait max 2 seconds
+             if sniffer_thread.is_alive():
+                 logging.warning("Sniffer thread did not exit cleanly after 2 seconds.")
+
+        # Note: The static server thread is a daemon, so it will exit automatically
+        # when the main thread exits. No explicit shutdown needed here unless
+        # serve_forever was interrupted differently.
+
+        logging.info("Server shutdown complete.")
 
 if __name__ == "__main__":
     import os
