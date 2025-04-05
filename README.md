@@ -2,6 +2,10 @@
 
 CalcuLatency is a Python-based tool designed to detect the presence of network proxies between a client and a server. It achieves this by comparing the Round-Trip Time (RTT) measured over a WebSocket connection against the RTT measured using a low-level network path tracing technique (0trace).
 
+## Live Demo
+
+You can try a live version of this service hosted on AWS here: [http://13.203.195.215:8081](http://13.203.195.215:8081)
+
 ## How it Works
 
 The core principle is that a direct network path (measured by 0trace) should generally have a lower RTT than a path going through an application-level proxy (measured via WebSocket ping/pong). If the WebSocket RTT is significantly higher than the 0trace RTT, it suggests the WebSocket connection is being routed through an intermediary, likely a proxy.
@@ -57,6 +61,8 @@ Both versions share the same `config.py`, `websocket_ping.py`, `static_server.py
 
 ## Usage
 
+**Important:** For accurate proxy detection from external clients, the server running this tool **must have a publicly accessible IP address**. The 0trace technique needs to interact with internet routers between the client and the server. Running the server purely within a private LAN will likely not yield meaningful results for detecting internet-based proxies.
+
 1.  **Clone the repository.**
 2.  **Navigate to either the `Single_client` or `Multi_client` directory.**
     ```bash
@@ -73,7 +79,7 @@ Both versions share the same `config.py`, `websocket_ping.py`, `static_server.py
     ```
 5.  **Access the client interface:**
     *   The server will log the IP address and port for the static file server (defaulting to port 8081).
-    *   Open a web browser and navigate to `http://13.203.195.215:8081`.
+    *   Open a web browser and navigate to `http://<server_ip>:8081` (e.g., `http://192.168.1.10:8081`).
 6.  **Click the "Start Test" button** on the web page to initiate the WebSocket connection and measurements.
 7.  The results will be displayed on the web page.
 
