@@ -9,39 +9,33 @@ import threading
 
 def run_static_server(port, directory):
     """
-    Runs a simple HTTP server for static files in the current thread.
-    Intended to be run in a separate thread by the caller.
+    Runs a simple HTTP server for static files. Meant to run in a thread.
 
     Args:
-        port (int): The port number to bind the server to.
-        directory (str): The root directory from which to serve files.
+        port (int): Port to bind to.
+        directory (str): Root directory to serve files from.
     """
-    # Ensure the directory exists relative to the server's execution path
+    # Ensure the directory exists
     if not os.path.isdir(directory):
         logging.error(f"Static directory '{directory}' not found. Cannot start static server.")
         return
 
-    # Use functools.partial to set the directory for the handler
-    # This ensures the handler knows where to find files relative to 'directory'
+    # Set the directory for the handler using partial
     handler = functools.partial(http.server.SimpleHTTPRequestHandler, directory=directory)
 
-    # Allow address reuse (useful for quick restarts)
-    socketserver.TCPServer.allow_reuse_address = True
+    socketserver.TCPServer.allow_reuse_address = True # Allow address reuse
 
     try:
-        # Create and serve the server, binding to all interfaces
         with socketserver.TCPServer(("", port), handler) as httpd:
-            # Get the current thread's name for logging
             thread_name = threading.current_thread().name
             logging.info(f"Static file server thread '{thread_name}' started on http://0.0.0.0:{port}, serving '{directory}'")
-            httpd.serve_forever() # This blocks the current thread until shutdown() is called
+            httpd.serve_forever() # Blocks until shutdown() is called
     except OSError as e:
-        # Common error: Port already in use
-        logging.error(f"Static file server failed to start on port {port}: {e}")
+        logging.error(f"Static file server failed to start on port {port}: {e}") # Common error: Port in use
     except Exception as e:
         logging.error(f"Static file server encountered an unexpected error: {e}")
     finally:
-        # This part is reached when serve_forever() finishes (e.g., after httpd.shutdown())
+        # Reached when serve_forever() finishes
         thread_name = threading.current_thread().name
         logging.info(f"Static file server thread '{thread_name}' stopped.")
 
@@ -50,17 +44,17 @@ def start_static_server_thread(port, directory):
     Starts the static file server in a separate daemon thread.
 
     Args:
-        port (int): The port number for the server.
-        directory (str): The directory to serve.
+        port (int): Port for the server.
+        directory (str): Directory to serve.
 
     Returns:
-        threading.Thread: The thread object running the server, or None if failed to start.
+        threading.Thread: The server thread object, or None if failed.
     """
     server_thread = threading.Thread(
         target=run_static_server,
         args=(port, directory),
-        daemon=True, # Allows main program to exit even if this thread is running
-        name=f"StaticServerThread-{port}" # Give the thread a descriptive name
+        daemon=True, # Allows main program exit even if thread runs
+        name=f"StaticServerThread-{port}"
     )
     try:
         server_thread.start()
