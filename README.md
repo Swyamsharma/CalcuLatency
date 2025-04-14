@@ -2,10 +2,6 @@
 
 CalcuLatency is a Python-based tool designed to detect the presence of network proxies between a client and a server. It achieves this by comparing the Round-Trip Time (RTT) measured over a WebSocket connection against the RTT measured using a low-level network path tracing technique (0trace).
 
-## Live Demo
-
-You can try a live version of this service hosted on AWS here: [http://13.203.195.215:8081](http://13.203.195.215:8081)
-
 ## How it Works
 
 The core principle is that a direct network path (measured by 0trace) should generally have a lower RTT than a path going through an application-level proxy (measured via WebSocket ping/pong). If the WebSocket RTT is significantly higher than the 0trace RTT, it suggests the WebSocket connection is being routed through an intermediary, likely a proxy.
